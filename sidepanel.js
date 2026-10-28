@@ -105,10 +105,10 @@ const EXTRACTED_PRODUCT_JSON_SCHEMA = {
 // Load state from chrome.storage.local
 async function loadState() {
   return new Promise(resolve => {
-    chrome.storage.local.get(['spcsp_comparison_sessions_v1', 'spcsp_active_session_id_v1', 'spcsp_extension_settings_v1'], res => {
+    chrome.storage.local.get(['spcsp_comparison_sessions_v2', 'spcsp_active_session_id_v2', 'spcsp_extension_settings_v1'], res => {
       resolve({
-        sessions: res.spcsp_comparison_sessions_v1 || [],
-        activeSessionId: res.spcsp_active_session_id_v1 || '',
+        sessions: res.spcsp_comparison_sessions_v2 || [],
+        activeSessionId: res.spcsp_active_session_id_v2 || '',
         settings: res.spcsp_extension_settings_v1 || { openaiApiKey: '', model: 'gpt-4o-mini' }
       });
     });
@@ -118,8 +118,8 @@ async function loadState() {
 async function saveState(sessions, activeId, settings) {
   return new Promise(resolve => {
     chrome.storage.local.set({
-      spcsp_comparison_sessions_v1: sessions,
-      spcsp_active_session_id_v1: activeId,
+      spcsp_comparison_sessions_v2: sessions,
+      spcsp_active_session_id_v2: activeId,
       spcsp_extension_settings_v1: settings
     }, resolve);
   });
@@ -214,20 +214,69 @@ async function extractActiveTab(apiKey) {
   if (scraped.detectedPrice && Number.isFinite(scraped.detectedPrice) && scraped.detectedPrice > 0) {
     price = scraped.detectedPrice;
   } else {
+    // 1. Off-price pattern: "$14.99 Compare At $22" or "$14.99 ... you're saving $7!"
+    const compareAtMatch = text.match(/\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*(?:Compare At|Comp Value|Comparable Value|Compare to)/i);
+    const savingMatch = text.match(/\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*(?:[^\n$]{0,40})\s*you're saving/i);
+
+    // 2. High-priority buy box labels
     const onlineMatch = text.match(/price when purchased online[:\s]*\$?\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/i);
     const newOptionMatch = text.match(/\bNew\s+\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/i);
     const nowMatch = text.match(/\b(?:Now|Current Price:?)\s*\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/i);
 
-    if (onlineMatch) {
+    if (compareAtMatch) {
+      price = parseFloat(compareAtMatch[1].replace(/,/g, ''));
+    } else if (savingMatch) {
+      price = parseFloat(savingMatch[1].replace(/,/g, ''));
+    } else if (onlineMatch) {
       price = parseFloat(onlineMatch[1].replace(/,/g, ''));
     } else if (newOptionMatch) {
       price = parseFloat(newOptionMatch[1].replace(/,/g, ''));
     } else if (nowMatch) {
       price = parseFloat(nowMatch[1].replace(/,/g, ''));
     } else {
-      const pMatch = text.match(/\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/);
-      if (pMatch) price = parseFloat(pMatch[1].replace(/,/g, ''));
+      // Scan dollar amounts, skipping promo thresholds like "$89+ Free Shipping" and "Compare At" anchors
+      const dollarRegex = /\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/g;
+      let m;
+      let foundPrice = null;
+      while ((m = dollarRegex.exec(text)) !== null) {
+        const fullMatch = m[0];
+        const val = parseFloat(m[1].replace(/,/g, ''));
+        const idx = m.index;
+        const before = text.slice(Math.max(0, idx - 45), idx).toLowerCase();
+        const after = text.slice(idx + fullMatch.length, idx + fullMatch.length + 45).toLowerCase();
+
+        if (
+          after.startsWith('+') ||
+          before.includes('free shipping') ||
+          before.includes('shipping on orders') ||
+          before.includes('spend') ||
+          before.includes('orders over') ||
+          after.includes('free shipping') ||
+          after.includes('with code ship') ||
+          after.includes('order') ||
+          before.includes('code ship') ||
+          before.includes('compare at') ||
+          before.includes('comp value') ||
+          before.includes("you're saving") ||
+          before.includes('you save')
+        ) {
+          continue;
+        }
+
+        if (Number.isFinite(val) && val > 0) {
+          foundPrice = val;
+          break;
+        }
+      }
+      if (foundPrice !== null) price = foundPrice;
     }
+  }
+
+  // Shipping cost
+  let shippingCost = 0;
+  if (!/\bfree shipping\b/i.test(text) && !/\bfree delivery\b/i.test(text)) {
+    const shipMatch = text.match(/(?:shipping|delivery)[:\s]*\+\s*\$\s*(\d+(?:\.\d{2})?)|(?:\$\s*(\d+(?:\.\d{2})?)\s*shipping)/i);
+    if (shipMatch) shippingCost = parseFloat(shipMatch[1] || shipMatch[2] || '0');
   }
 
   return {
@@ -238,7 +287,7 @@ async function extractActiveTab(apiKey) {
     variant_color: /white/i.test(text) ? 'White' : /black/i.test(text) ? 'Black' : null,
     variant_specs: /dock/i.test(text) ? '+Charging Dock' : null,
     base_price: price,
-    shipping_cost: 0,
+    shipping_cost: shippingCost,
     condition: /refurbished/i.test(text) ? 'refurbished' : /open.?box/i.test(text) ? 'open_box' : 'new',
     condition_detail: /refurbished/i.test(text) ? 'Manufacturer Refurbished' : null,
     rating: 4.8,
@@ -252,186 +301,12 @@ async function extractActiveTab(apiKey) {
 async function render() {
   const root = document.getElementById('sidepanel-root');
   let state = await loadState();
-  if (state.sessions.length === 0) {
-    state.sessions = [
-      {
-        id: 'sess-controllers',
-        name: '🎮 Game Controllers',
-        baseline_item_id: 'item-ctrl-target',
-        items: [
-          {
-            id: 'item-ctrl-target',
-            vendor: 'Target',
-            raw_title: 'Sony DualSense Wireless Controller – Galactic Purple',
-            brand: 'Sony',
-            base_model: 'Sony DualSense Controller',
-            variant_color: 'Galactic Purple',
-            variant_specs: null,
-            base_price: 69.99,
-            shipping_cost: 0,
-            condition: 'new',
-            condition_detail: null,
-            rating: 4.8,
-            fulfillment_speed: '2-Day Delivery',
-            url: 'https://www.target.com/p/dualsense-wireless-controller-for-playstation-5-galactic-purple/-/A-84719201',
-            total_landed_cost: 69.99,
-            badges: []
-          },
-          {
-            id: 'item-ctrl-walmart',
-            vendor: 'Walmart',
-            raw_title: 'Sony PS5 DualSense Wireless Controller (Cosmic Red) – New',
-            brand: 'Sony',
-            base_model: 'Sony DualSense Controller',
-            variant_color: 'Cosmic Red',
-            variant_specs: null,
-            base_price: 67.61,
-            shipping_cost: 0,
-            condition: 'new',
-            condition_detail: null,
-            rating: 4.6,
-            fulfillment_speed: '2-Day Delivery',
-            url: 'https://www.walmart.com/ip/PS5-DualSense-Wireless-Controller-LISA-Limited-Edition/18264102609',
-            total_landed_cost: 67.61,
-            badges: []
-          }
-        ]
-      },
-      {
-        id: 'sess-chairs',
-        name: '🪑 Office Chairs',
-        baseline_item_id: 'item-chair-hm-new',
-        items: [
-          {
-            id: 'item-chair-hm-new',
-            vendor: 'Herman Miller',
-            raw_title: 'Herman Miller Aeron Chair – Mineral / Polished Aluminum (New)',
-            brand: 'Herman Miller',
-            base_model: 'Herman Miller Aeron',
-            variant_color: 'Mineral / Satin Aluminum',
-            variant_specs: 'PostureFit SL Dual Lumbar · Fully Adjustable',
-            base_price: 1495.0,
-            shipping_cost: 0,
-            condition: 'new',
-            condition_detail: null,
-            rating: 4.9,
-            fulfillment_speed: 'Free White Glove Delivery',
-            url: 'https://store.hermanmiller.com/office-chairs/aeron-chair/2195368.html',
-            total_landed_cost: 1495.0,
-            badges: []
-          },
-          {
-            id: 'item-chair-crandall',
-            vendor: 'Crandall Office',
-            raw_title: 'Herman Miller Aeron Remanufactured Task Chair (Grade A+ Certified)',
-            brand: 'Herman Miller',
-            base_model: 'Herman Miller Aeron',
-            variant_color: 'Carbon Graphite',
-            variant_specs: 'Size B · Upgraded 3D Mesh & Lumbar Pad',
-            base_price: 749.0,
-            shipping_cost: 0,
-            condition: 'refurbished',
-            condition_detail: 'Remanufactured - Certified Grade A+',
-            rating: 4.8,
-            fulfillment_speed: 'Free 3-Day Ground Shipping',
-            url: 'https://www.crandalloffice.com/remanufactured-herman-miller-aeron/',
-            total_landed_cost: 749.0,
-            badges: []
-          },
-          {
-            id: 'item-chair-amazon-used',
-            vendor: 'Amazon Marketplace',
-            raw_title: 'Herman Miller Aeron Classic Task Chair – Used Good (Minor Scuffs)',
-            brand: 'Herman Miller',
-            base_model: 'Herman Miller Aeron',
-            variant_color: 'Classic Mineral Gray',
-            variant_specs: 'Size B · Basic Lumbar Pad',
-            base_price: 589.0,
-            shipping_cost: 69.0,
-            condition: 'used',
-            condition_detail: 'Used - Noticeable Scuffs',
-            rating: 3.1,
-            fulfillment_speed: 'Standard 5-7 Day Freight',
-            url: 'https://www.amazon.com/dp/B002L15NUC/herman-miller-aeron-used',
-            total_landed_cost: 658.0,
-            badges: []
-          }
-        ]
-      },
-      {
-        id: 'sess-monitors',
-        name: '🖥️ 4K Monitors',
-        baseline_item_id: 'item-mon-lg',
-        items: [
-          {
-            id: 'item-mon-lg',
-            vendor: 'Amazon',
-            raw_title: 'LG 27GP950-B 27" UltraGear UHD 4K Nano IPS 144Hz Monitor',
-            brand: 'LG',
-            base_model: 'LG 27" UltraGear 4K Monitor',
-            variant_color: 'Matte Black',
-            variant_specs: '27-inch 4K 144Hz',
-            base_price: 549.99,
-            shipping_cost: 0,
-            condition: 'new',
-            condition_detail: null,
-            rating: 4.6,
-            fulfillment_speed: '2-Day Delivery',
-            url: 'https://www.amazon.com/LG-27GP950-B-Ultragear-Compatible-Monitor/dp/B094RWMN8K',
-            total_landed_cost: 549.99,
-            badges: []
-          }
-        ]
-      },
-      {
-        id: 'sess-flights',
-        name: '✈️ SFO → JFK Flights',
-        baseline_item_id: 'item-fl-delta',
-        items: [
-          {
-            id: 'item-fl-delta',
-            vendor: 'Delta Air Lines',
-            raw_title: 'Delta Flight DL 482 – SFO to JFK (Nonstop, Main Cabin)',
-            brand: 'Delta',
-            base_model: 'SFO → JFK Flight',
-            variant_color: 'Depart 8:15 AM',
-            variant_specs: 'Main Cabin (Free Carry-On Included)',
-            base_price: 249.0,
-            shipping_cost: 0,
-            condition: 'new',
-            condition_detail: null,
-            rating: 4.7,
-            fulfillment_speed: 'Nonstop (5h 25m)',
-            url: 'https://www.delta.com/flight-search/sfo-jfk-dl482',
-            total_landed_cost: 249.0,
-            badges: []
-          },
-          {
-            id: 'item-fl-spirit',
-            vendor: 'Spirit Airlines',
-            raw_title: 'Spirit Airlines Flight NK 912 – SFO to LGA via ORD (1-Stop)',
-            brand: 'Spirit',
-            base_model: 'SFO → LGA Flight',
-            variant_color: 'Depart 6:30 AM',
-            variant_specs: '+ $55 Carry-On Bag Fee',
-            base_price: 139.0,
-            shipping_cost: 55.0,
-            condition: 'open_box',
-            condition_detail: 'Basic Bare Fare',
-            rating: 2.6,
-            fulfillment_speed: '1-Stop via ORD (8h 45m)',
-            url: 'https://www.spirit.com/flights/sfo-lga-nk912',
-            total_landed_cost: 194.0,
-            badges: []
-          }
-        ]
-      }
-    ];
-    state.activeSessionId = 'sess-controllers';
-    await saveState(state.sessions, state.activeSessionId, state.settings);
+
+  let currentSession = null;
+  if (state.sessions && state.sessions.length > 0) {
+    currentSession = state.sessions.find(s => s.id === state.activeSessionId) || state.sessions[0];
+    currentSession = rankSession(currentSession);
   }
-  let currentSession = state.sessions.find(s => s.id === state.activeSessionId) || state.sessions[0];
-  currentSession = rankSession(currentSession);
 
   root.innerHTML = `
     <div style="display:flex; flex-direction:column; height:100vh; font-family:'DM Sans', sans-serif;">
@@ -456,9 +331,9 @@ async function render() {
       <!-- Category Switcher Pill Bar -->
       <div style="background:#fff; border-bottom:1px solid #e2e8f0; padding:8px 12px; display:flex; gap:6px; overflow-x:auto; align-items:center;">
         ${state.sessions.map(s => `
-          <button class="btn-category-chip" data-id="${s.id}" style="border:none; cursor:pointer; padding:4px 10px; border-radius:20px; font-size:11px; font-weight:600; white-space:nowrap; display:flex; align-items:center; gap:5px; background:${s.id === currentSession.id ? '#0f172a' : '#f1f5f9'}; color:${s.id === currentSession.id ? '#ffffff' : '#334155'};">
+          <button class="btn-category-chip" data-id="${s.id}" style="border:none; cursor:pointer; padding:4px 10px; border-radius:20px; font-size:11px; font-weight:600; white-space:nowrap; display:flex; align-items:center; gap:5px; background:${currentSession && s.id === currentSession.id ? '#0f172a' : '#f1f5f9'}; color:${currentSession && s.id === currentSession.id ? '#ffffff' : '#334155'};">
             <span>${s.name}</span>
-            <span style="font-size:10px; background:${s.id === currentSession.id ? '#334155' : '#e2e8f0'}; padding:1px 5px; border-radius:10px;">${s.items.length}</span>
+            <span style="font-size:10px; background:${currentSession && s.id === currentSession.id ? '#334155' : '#e2e8f0'}; padding:1px 5px; border-radius:10px;">${s.items.length}</span>
           </button>
         `).join('')}
         <button id="btn-add-category" style="background:#ecfdf5; color:#047857; border:1px solid #a7f3d0; padding:4px 8px; border-radius:20px; font-size:11px; font-weight:600; cursor:pointer; white-space:nowrap;">
@@ -471,60 +346,71 @@ async function render() {
         <button id="btn-add-tab" style="flex:1; background:#10b981; color:#fff; border:none; padding:8px 12px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;">
           <span>+ Add Current Tab</span>
         </button>
-        <button id="btn-reopen-all" style="background:#f1f5f9; color:#1e293b; border:1px solid #cbd5e1; padding:8px 10px; border-radius:6px; font-size:11px; font-weight:600; cursor:pointer;">
+        <button id="btn-reopen-all" ${!currentSession || currentSession.items.length === 0 ? 'disabled style="background:#f8fafc; color:#94a3b8; border:1px solid #e2e8f0; padding:8px 10px; border-radius:6px; font-size:11px; font-weight:600; cursor:not-allowed;"' : 'style="background:#f1f5f9; color:#1e293b; border:1px solid #cbd5e1; padding:8px 10px; border-radius:6px; font-size:11px; font-weight:600; cursor:pointer;"'}>
           Re-open All
         </button>
       </div>
 
-      <!-- Item Count & Category Actions -->
-      <div style="background:#f8fafc; border-bottom:1px solid #e2e8f0; padding:8px 14px; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <span>Category: <strong>${currentSession.name}</strong> (${currentSession.items.length} items)</span>
-        </div>
-        <div style="display:flex; align-items:center; gap:8px;">
-          <button id="btn-clear-category" title="Clear all listings in this category to start fresh" style="background:none; border:none; color:#b45309; font-size:11px; font-weight:600; cursor:pointer; text-decoration:underline;">Reset comparisons</button>
-          <span style="color:#cbd5e1;">·</span>
-          <button id="btn-delete-category" title="Permanently delete this category" style="background:none; border:none; color:#ef4444; font-size:11px; font-weight:600; cursor:pointer; text-decoration:underline;">Delete category</button>
-        </div>
-      </div>
-
-      <!-- Ranked List -->
-      <div id="items-container" style="flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px;">
-        ${currentSession.items.length === 0 ? `
-          <div style="text-align:center; padding:40px 20px; color:#94a3b8; font-size:12px;">
-            No items in session yet.<br/>Browse store tabs and click <strong>+ Add Current Tab</strong>!
+      ${currentSession ? `
+        <!-- Item Count & Category Actions -->
+        <div style="background:#f8fafc; border-bottom:1px solid #e2e8f0; padding:8px 14px; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <span>Category: <strong>${currentSession.name}</strong> (${currentSession.items.length} items)</span>
           </div>
-        ` : currentSession.items.map((item, idx) => `
-          <div style="background:#fff; border:${idx === 0 ? '2px solid #10b981' : '1px solid #e2e8f0'}; border-radius:8px; padding:10px; box-shadow:0 1px 2px rgba(0,0,0,0.04);">
-            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-              <div>
-                <span style="background:${idx === 0 ? '#10b981' : '#f1f5f9'}; color:${idx === 0 ? '#fff' : '#475569'}; padding:2px 6px; border-radius:4px; font-size:10px; font-weight:700; font-family:monospace;">#${idx + 1}</span>
-                <strong style="font-size:12px; margin-left:6px; color:#0f172a;">${item.vendor}</strong>
-                ${idx === 0 ? '<span style="color:#059669; font-size:11px; font-weight:700; margin-left:4px;">· Winner</span>' : ''}
-              </div>
-              <div style="text-align:right;">
-                <div style="font-size:16px; font-weight:700; font-family:'JetBrains Mono', monospace;">$${item.total_landed_cost.toFixed(2)}</div>
-                <div style="font-size:10px; color:#64748b; font-family:monospace;">$${item.base_price.toFixed(2)} + ${item.shipping_cost > 0 ? '$' + item.shipping_cost.toFixed(2) + ' ship' : 'Free ship'}</div>
-              </div>
-            </div>
-
-            <div style="font-size:12px; font-weight:500; color:#1e293b; margin:6px 0;">${item.raw_title}</div>
-
-            <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:6px;">
-              ${item.badges.map(b => `
-                <span style="font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; background:${b.type === 'danger' ? '#fee2e2' : b.type === 'warning' ? '#fef3c7' : '#e0f2fe'}; color:${b.type === 'danger' ? '#b91c1c' : b.type === 'warning' ? '#92400e' : '#0369a1'}; border:1px solid ${b.type === 'danger' ? '#fca5a5' : b.type === 'warning' ? '#fde68a' : '#bae6fd'};">
-                  ${b.label}
-                </span>
-              `).join('')}
-            </div>
-
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; padding-top:6px; border-top:1px solid #f1f5f9; font-size:10px; color:#64748b;">
-              <button class="btn-remove" data-id="${item.id}" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:10px; padding:0;">Remove</button>
-              <a href="${item.url}" target="_blank" style="color:#2563eb; text-decoration:none;">Open Listing →</a>
-            </div>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <button id="btn-clear-category" title="Clear all listings in this category to start fresh" style="background:none; border:none; color:#b45309; font-size:11px; font-weight:600; cursor:pointer; text-decoration:underline;">Reset comparisons</button>
+            <span style="color:#cbd5e1;">·</span>
+            <button id="btn-delete-category" title="Permanently delete this category" style="background:none; border:none; color:#ef4444; font-size:11px; font-weight:600; cursor:pointer; text-decoration:underline;">Delete category</button>
           </div>
-        `).join('')}
-      </div>
+        </div>
+
+        <!-- Ranked List -->
+        <div id="items-container" style="flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:10px;">
+          ${currentSession.items.length === 0 ? `
+            <div style="text-align:center; padding:40px 20px; color:#94a3b8; font-size:12px;">
+              No items in this category yet.<br/>Browse store tabs and click <strong>+ Add Current Tab</strong>!
+            </div>
+          ` : currentSession.items.map((item, idx) => `
+            <div style="background:#fff; border:${idx === 0 ? '2px solid #10b981' : '1px solid #e2e8f0'}; border-radius:8px; padding:10px; box-shadow:0 1px 2px rgba(0,0,0,0.04);">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                <div>
+                  <span style="background:${idx === 0 ? '#10b981' : '#f1f5f9'}; color:${idx === 0 ? '#fff' : '#475569'}; padding:2px 6px; border-radius:4px; font-size:10px; font-weight:700; font-family:monospace;">#${idx + 1}</span>
+                  <strong style="font-size:12px; margin-left:6px; color:#0f172a;">${item.vendor}</strong>
+                  ${idx === 0 ? '<span style="color:#059669; font-size:11px; font-weight:700; margin-left:4px;">· Winner</span>' : ''}
+                </div>
+                <div style="text-align:right;">
+                  <div style="font-size:16px; font-weight:700; font-family:'JetBrains Mono', monospace;">$${item.total_landed_cost.toFixed(2)}</div>
+                  <div style="font-size:10px; color:#64748b; font-family:monospace;">$${item.base_price.toFixed(2)} + ${item.shipping_cost > 0 ? '$' + item.shipping_cost.toFixed(2) + ' ship' : 'Free ship'}</div>
+                </div>
+              </div>
+
+              <div style="font-size:12px; font-weight:500; color:#1e293b; margin:6px 0;">${item.raw_title}</div>
+
+              <div style="display:flex; flex-wrap:wrap; gap:4px; margin-top:6px;">
+                ${item.badges.map(b => `
+                  <span style="font-size:10px; padding:2px 6px; border-radius:3px; font-weight:600; background:${b.type === 'danger' ? '#fee2e2' : b.type === 'warning' ? '#fef3c7' : '#e0f2fe'}; color:${b.type === 'danger' ? '#b91c1c' : b.type === 'warning' ? '#92400e' : '#0369a1'}; border:1px solid ${b.type === 'danger' ? '#fca5a5' : b.type === 'warning' ? '#fde68a' : '#bae6fd'};">
+                    ${b.label}
+                  </span>
+                `).join('')}
+              </div>
+
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-top:8px; padding-top:6px; border-top:1px solid #f1f5f9; font-size:10px; color:#64748b;">
+                <button class="btn-remove" data-id="${item.id}" style="background:none; border:none; color:#ef4444; cursor:pointer; font-size:10px; padding:0;">Remove</button>
+                <a href="${item.url}" target="_blank" style="color:#2563eb; text-decoration:none;">Open Listing →</a>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      ` : `
+        <!-- 0 Categories Empty State -->
+        <div style="flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:32px 20px; text-align:center;">
+          <div style="background:#f1f5f9; width:48px; height:48px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:24px; margin-bottom:12px;">🛍️</div>
+          <div style="font-size:14px; font-weight:700; color:#0f172a; margin-bottom:6px;">0 Categories · 0 Comparisons</div>
+          <div style="font-size:12px; color:#64748b; max-width:260px; line-height:1.5; margin-bottom:20px;">
+            Start comparing prices! Navigate to any product page and click <strong>+ Add Current Tab</strong>, or click <strong>+ Category</strong> above.
+          </div>
+        </div>
+      `}
     </div>
   `;
 
@@ -554,11 +440,24 @@ async function render() {
         badges: [],
         collected_at: Date.now()
       };
-      currentSession.items.push(newItem);
-      if (!currentSession.baseline_item_id) currentSession.baseline_item_id = newItem.id;
-      currentSession = rankSession(currentSession);
-      const sessionIndex = state.sessions.findIndex(s => s.id === currentSession.id);
-      state.sessions[sessionIndex] = currentSession;
+
+      if (!currentSession) {
+        currentSession = {
+          id: 'sess-' + Date.now(),
+          name: extracted.base_model ? extracted.base_model.slice(0, 30) : 'My Comparisons',
+          baseline_item_id: newItem.id,
+          items: [newItem]
+        };
+        state.sessions.push(currentSession);
+        state.activeSessionId = currentSession.id;
+      } else {
+        currentSession.items.push(newItem);
+        if (!currentSession.baseline_item_id) currentSession.baseline_item_id = newItem.id;
+        currentSession = rankSession(currentSession);
+        const sessionIndex = state.sessions.findIndex(s => s.id === currentSession.id);
+        state.sessions[sessionIndex] = currentSession;
+      }
+
       await saveState(state.sessions, state.activeSessionId, state.settings);
       render();
     } catch (e) {
@@ -567,15 +466,18 @@ async function render() {
     }
   };
 
-  document.getElementById('btn-reopen-all').onclick = async () => {
-    if (!currentSession.items || currentSession.items.length === 0) return;
-    for (const it of currentSession.items) {
-      chrome.tabs.create({ url: it.url, active: false });
-    }
-  };
+  const reopenBtn = document.getElementById('btn-reopen-all');
+  if (reopenBtn && currentSession && currentSession.items.length > 0) {
+    reopenBtn.onclick = async () => {
+      for (const it of currentSession.items) {
+        chrome.tabs.create({ url: it.url, active: false });
+      }
+    };
+  }
 
   document.querySelectorAll('.btn-remove').forEach(btn => {
     btn.onclick = async () => {
+      if (!currentSession) return;
       const id = btn.getAttribute('data-id');
       currentSession.items = currentSession.items.filter(i => i.id !== id);
       const sessionIndex = state.sessions.findIndex(s => s.id === currentSession.id);
@@ -597,7 +499,7 @@ async function render() {
   const addCatBtn = document.getElementById('btn-add-category');
   if (addCatBtn) {
     addCatBtn.onclick = async () => {
-      const name = prompt('Enter name for new comparison category (e.g. Office Chairs, Laptops, Headphones):');
+      const name = prompt('Enter name for new comparison category (e.g. Perfumes, Shirts, Headphones):');
       if (!name || !name.trim()) return;
       const newSession = {
         id: 'sess-' + Date.now(),
@@ -613,7 +515,7 @@ async function render() {
   }
 
   const clearCatBtn = document.getElementById('btn-clear-category');
-  if (clearCatBtn) {
+  if (clearCatBtn && currentSession) {
     clearCatBtn.onclick = async () => {
       if (confirm(`Reset comparisons in "${currentSession.name}"? This will clear all listings in this category so you can start fresh.`)) {
         currentSession.items = [];
@@ -627,16 +529,11 @@ async function render() {
   }
 
   const deleteCatBtn = document.getElementById('btn-delete-category');
-  if (deleteCatBtn) {
+  if (deleteCatBtn && currentSession) {
     deleteCatBtn.onclick = async () => {
       if (confirm(`Permanently delete category "${currentSession.name}" and all its saved comparisons?`)) {
-        if (state.sessions.length <= 1) {
-          state.sessions = [{ id: 'sess-' + Date.now(), name: 'My Comparisons', baseline_item_id: null, items: [] }];
-          state.activeSessionId = state.sessions[0].id;
-        } else {
-          state.sessions = state.sessions.filter(s => s.id !== currentSession.id);
-          state.activeSessionId = state.sessions[0].id;
-        }
+        state.sessions = state.sessions.filter(s => s.id !== currentSession.id);
+        state.activeSessionId = state.sessions[0]?.id || '';
         await saveState(state.sessions, state.activeSessionId, state.settings);
         render();
       }

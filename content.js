@@ -12,7 +12,22 @@ function detectActiveBuyBoxPrice() {
     '[data-testid="customer-price"]',
     '#corePrice_feature_div .a-price .a-offscreen',
     '#apex_desktop .a-price .a-offscreen',
-    'span.priceToPay span.a-offscreen'
+    'span.priceToPay span.a-offscreen',
+    // TJ Maxx, Marshalls, Sierra & off-price apparel/perfume
+    '.product-price .price',
+    '.product-details .price',
+    '.price-sales',
+    '.price-current',
+    '.current-price',
+    '.sales-price',
+    '.pdp-price',
+    'span.price',
+    '[data-test="product-price"]',
+    '[data-testid="product-price"]',
+    '.product-pricing .price',
+    'span.price-value',
+    'span.discounted-price',
+    '.product-offer-price'
   ];
 
   for (const sel of buyBoxSelectors) {
@@ -21,7 +36,13 @@ function detectActiveBuyBoxPrice() {
       if (el.closest('[data-testid="swatch-group"], [aria-label*="swatch"], .swatches, .variant-options')) {
         continue;
       }
+      if (el.closest('header, [role="banner"], [class*="promo"], [class*="announcement"], [class*="banner"], [class*="shipping"]')) {
+        continue;
+      }
       const text = el.textContent || '';
+      if (/\b(?:free shipping|with code|orders?|spend)\b/i.test(text) || /\$\s*\d+\+/i.test(text)) {
+        continue;
+      }
       const m = text.match(/\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/) || text.match(/(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/);
       if (m) {
         const val = parseFloat(m[1].replace(/,/g, ''));
@@ -31,6 +52,25 @@ function detectActiveBuyBoxPrice() {
   }
 
   const bodyText = document.body.innerText || '';
+
+  // TJ Maxx / Off-price: "$14.99 Compare At $22"
+  const compareAtMatch = bodyText.match(
+    /\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*(?:Compare At|Comp Value|Comparable Value|Compare to)/i
+  );
+  if (compareAtMatch) {
+    const val = parseFloat(compareAtMatch[1].replace(/,/g, ''));
+    if (Number.isFinite(val) && val > 0) return val;
+  }
+
+  // TJ Maxx / Discount: "$14.99 ... you're saving $7!"
+  const savingMatch = bodyText.match(
+    /\$\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)\s*(?:[^\n$]{0,40})\s*you're saving/i
+  );
+  if (savingMatch) {
+    const val = parseFloat(savingMatch[1].replace(/,/g, ''));
+    if (Number.isFinite(val) && val > 0) return val;
+  }
+
   const onlineMatch = bodyText.match(/price when purchased online[:\s]*\$?\s*(\d{1,4}(?:,\d{3})*(?:\.\d{2})?)/i);
   if (onlineMatch) {
     const val = parseFloat(onlineMatch[1].replace(/,/g, ''));
@@ -95,9 +135,9 @@ function scrapeProductTab() {
     }
   });
 
-  // Extract cleaned visible text
+  // Extract cleaned visible text (stripping site-wide promo banners)
   const clone = document.body.cloneNode(true);
-  clone.querySelectorAll('script, style, noscript, svg, nav, footer, iframe').forEach(el => el.remove());
+  clone.querySelectorAll('script, style, noscript, svg, nav, footer, iframe, header, [role="banner"], [class*="promo-bar"], [class*="promo_bar"], [class*="announcement"], [class*="shipping-promo"], [class*="shipping_promo"], [id*="shipping-promo"], [id*="announcement"], [class*="top-banner"], [class*="site-banner"], [class*="header-promo"]').forEach(el => el.remove());
   const visibleTextSnippet = (clone.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 6500);
 
   return {
